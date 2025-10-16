@@ -6,9 +6,9 @@ from typing import Dict, List
 PACKAGES: Dict[str, Dict[str, int | float | str]] = {
     "demo": {
         "title": "Demo Package",
-        "description": "Access mu insight for 3 days and receive 3 tokens.",
+        "description": "Upgrade to mu insight for 3 days and receive 1 token.",
         "price": 0,
-        "tokens": 3,
+        "tokens": 1,
         "duration": 0,
         "duration_days": 3,
     },

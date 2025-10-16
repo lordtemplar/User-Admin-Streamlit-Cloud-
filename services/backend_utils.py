@@ -11,9 +11,12 @@ import re
 import ast
 import random
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import threading
 import time
 import builtins
+import copy
+from typing import Any, Dict
 from config import GPT_API_KEY, MONGO_URL, GPT_URL
 
 def safe_print(*args, **kwargs):
@@ -36,6 +39,11 @@ def debug_print(*args, **kwargs):
     if DEBUG_ENABLED:
         safe_print(*args, **kwargs)
 
+
+def _now_iso() -> str:
+    """Return current UTC timestamp in ISO-8601 format."""
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 def call_gpt(text_input):
     # url = "http://10.104.0.5:32124/api/chat/completions"
     url = GPT_URL
@@ -56,7 +64,23 @@ def call_gpt(text_input):
         # "stream": False
     }
 
-    response = requests.post(url, json=payload, headers=headers)
+    retries = Retry(
+        total=3,
+        connect=3,
+        read=2,
+        backoff_factor=1.5,
+        status_forcelist=(408, 409, 429, 500, 502, 503, 504),
+        allowed_methods=None,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+
+    try:
+        with requests.Session() as session:
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            response = session.post(url, json=payload, headers=headers, timeout=(5, 60))
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(f"GPT request failed: {exc}") from exc
 
     status = response.status_code
     try:
@@ -87,6 +111,20 @@ def call_gpt(text_input):
     
     return status, content
 
+
+def _update_gpt_status(line_id: str, **updates: Any) -> Dict[str, Any]:
+    entry = BG_STD_TASK_STATUS.setdefault(line_id, {"line_id": line_id})
+    entry.update(updates)
+    entry["updated_at"] = _now_iso()
+    return entry
+
+
+def get_gpt_task_status(line_id: str) -> Dict[str, Any] | None:
+    entry = BG_STD_TASK_STATUS.get(line_id)
+    if entry is None:
+        return None
+    return copy.deepcopy(entry)
+
 def format_thai_date(date_str: str) -> str:
     # แปลง string เป็น datetime
     date_obj = datetime.strptime(date_str, "%Y_%m_%d")
@@ -111,6 +149,7 @@ CD = None
 GIF = None
 
 BG_STD_TASK = []
+BG_STD_TASK_STATUS: Dict[str, Dict[str, Any]] = {}
 
 # MONGO_URL = "mongodb://root:cvrlkiryo,%5E@10.104.0.6:27017/"
 DATABASE_NAME = "your_database"
@@ -1613,6 +1652,42 @@ def convert_to_structure2(text: str) -> dict:
     }
 
 
+def _run_gpt_update_worker(line_id: str) -> None:
+    """Run the GPT calendar rebuild in a background thread and track status."""
+    _update_gpt_status(
+        line_id,
+        status="running",
+        started_at=_now_iso(),
+        message="GPT calendar generation is processing.",
+    )
+    try:
+        summary = UpdatePeriodGPTAll(line_id)
+        _update_gpt_status(
+            line_id,
+            status="completed",
+            completed_at=_now_iso(),
+            message="GPT calendar generation finished.",
+            result=summary,
+        )
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        print(f"UpdatePeriodGPTAll worker crashed for {line_id}: {exc} ({type(exc).__name__})\n{tb}")
+        _update_gpt_status(
+            line_id,
+            status="error",
+            completed_at=_now_iso(),
+            message=str(exc),
+            last_error=str(exc),
+            traceback=tb,
+        )
+    finally:
+        if line_id in BG_STD_TASK:
+            BG_STD_TASK.remove(line_id)
+        _update_gpt_status(line_id, queue_size=len(BG_STD_TASK))
+
+
 def run_UpdatePeriodGPTAll_in_background(line_id: str):
     global BG_STD_TASK 
     if line_id in BG_STD_TASK:
@@ -1620,15 +1695,51 @@ def run_UpdatePeriodGPTAll_in_background(line_id: str):
         print('BG_STD_TASK',BG_STD_TASK)
         print(f'{line_id} exist process')
         print('x'*100)
-    else:
-        thread = threading.Thread(target=UpdatePeriodGPTAll, args=(line_id,))
-        thread.start()
+        return {
+            "status": "running",
+            "line_id": line_id,
+            "queue_size": len(BG_STD_TASK),
+            "message": "GPT calendar generation already running for this user.",
+            "details": get_gpt_task_status(line_id),
+        }
 
-        BG_STD_TASK.append(line_id)
-    return {"status": "started", "line_id": line_id}
+    queue_size = len(BG_STD_TASK) + 1
+    entry = _update_gpt_status(
+        line_id,
+        status="queued",
+        queue_size=queue_size,
+        started_at=_now_iso(),
+        message="GPT calendar generation started in background.",
+        processed_dates=0,
+        successful_count=0,
+        failed_count=0,
+        failed_results=[],
+        pending_dates=None,
+        total_dates=None,
+        last_request=None,
+    )
+
+    thread = threading.Thread(target=_run_gpt_update_worker, args=(line_id,), daemon=True)
+    thread.start()
+
+    BG_STD_TASK.append(line_id)
+    return {
+        "status": "started",
+        "line_id": line_id,
+        "queue_size": len(BG_STD_TASK),
+        "message": "GPT calendar generation started in background.",
+        "details": copy.deepcopy(entry),
+    }
 
 def UpdatePeriodGPTAll(line_id):
     global BG_STD_TASK 
+
+    _update_gpt_status(
+        line_id,
+        status="running",
+        message="Preparing GPT calendar rebuild.",
+        started_processing_at=_now_iso(),
+    )
 
     def get_peroid_aval(line_id):
             DATABASE_NAME = "users"
@@ -1772,9 +1883,9 @@ def UpdatePeriodGPTAll(line_id):
             res['theme'] = theme.strip('"').strip("'")
             debug_print('------======')
             debug_print(res)
-            return res
+            return res, status_code
             
-        res = cal_std_day(line_id,target_date)
+        res, status_code = cal_std_day(line_id,target_date)
         debug_print(res)
 
         client = MongoClient(MONGO_URL)
@@ -1786,13 +1897,14 @@ def UpdatePeriodGPTAll(line_id):
             {"$set": {f"period_predictions_gpt.{target_date}": res}},
             upsert=True
         )
+        return {"status_code": status_code, "result": res}
 
     pv = get_peroid_aval(line_id)
     debug_print(pv)
 
     start = datetime.strptime(pv['start_date'], '%Y-%m-%d')
     end = datetime.strptime(pv['end_date'], '%Y-%m-%d')
-    date_list = [(start + timedelta(days=i)).date().isoformat() for i in range((end - start).days + 1)]
+    all_dates = [(start + timedelta(days=i)).date().isoformat() for i in range((end - start).days + 1)]
 
     # 👇 Load existing prediction keys from MongoDB
     client = MongoClient(MONGO_URL)
@@ -1805,23 +1917,95 @@ def UpdatePeriodGPTAll(line_id):
         existing_dates = list(user_data["period_predictions_gpt"].keys())
 
     # 👇 Filter out dates that already exist
-    date_list = [d for d in date_list if d not in existing_dates]
+    pending_dates_list = [d for d in all_dates if d not in existing_dates]
+    skipped_existing = len(all_dates) - len(pending_dates_list)
 
 
-    debug_print(len(date_list))
+    debug_print(len(pending_dates_list))
     debug_print('-')
 
-    for target_date in date_list:
+
+    total_dates = len(pending_dates_list)
+    summary_data = {
+        "line_id": line_id,
+        "total_dates": total_dates,
+        "processed_dates": 0,
+        "successful_count": 0,
+        "failed_count": 0,
+        "failed_results": [],
+        "skipped_existing": skipped_existing,
+        "last_request": None,
+    }
+    _update_gpt_status(
+        line_id,
+        total_dates=total_dates,
+        pending_dates=total_dates,
+        processed_dates=0,
+        successful_count=0,
+        failed_count=0,
+        failed_results=[],
+        skipped_existing=skipped_existing,
+        last_request=None,
+    )
+
+    for target_date in pending_dates_list:
+        request_result = None
         try:
-            update_std_day(line_id,target_date)
+            request_result = update_std_day(line_id, target_date)
+            summary_data["successful_count"] += 1
+            summary_data["last_request"] = {
+                "date": target_date,
+                "status": "success",
+                "status_code": request_result.get("status_code") if isinstance(request_result, dict) else None,
+                "message": "GPT response stored.",
+            }
         except Exception as exc:  # noqa: BLE001
             import traceback
-            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-            print(f"UpdatePeriodGPTAll: failed to update {target_date} for {line_id}: {exc} ({type(exc).__name__})\\n{tb}")
 
-    if line_id in BG_STD_TASK:
-        BG_STD_TASK.remove(line_id)
-    
+            tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            print(f"UpdatePeriodGPTAll: failed to update {target_date} for {line_id}: {exc} ({type(exc).__name__})\n{tb}")
+            summary_data["failed_count"] += 1
+            failure_entry = {"date": target_date, "error": str(exc)}
+            summary_data["failed_results"].append(failure_entry)
+            summary_data["failed_results"] = summary_data["failed_results"][-10:]
+            summary_data["last_request"] = {
+                "date": target_date,
+                "status": "error",
+                "message": str(exc),
+            }
+        finally:
+            summary_data["processed_dates"] += 1
+            _update_gpt_status(
+                line_id,
+                processed_dates=summary_data["processed_dates"],
+                successful_count=summary_data["successful_count"],
+                failed_count=summary_data["failed_count"],
+                pending_dates=max(total_dates - summary_data["processed_dates"], 0),
+                failed_results=summary_data["failed_results"],
+                last_request=summary_data["last_request"],
+            )
+
+    summary = {
+        "line_id": line_id,
+        "total_dates": total_dates,
+        "processed_dates": summary_data["processed_dates"],
+        "successful_count": summary_data["successful_count"],
+        "failed_count": summary_data["failed_count"],
+        "failed_results": summary_data["failed_results"],
+        "skipped_existing": skipped_existing,
+    }
+    _update_gpt_status(
+        line_id,
+        processed_dates=summary["processed_dates"],
+        successful_count=summary["successful_count"],
+        failed_count=summary["failed_count"],
+        pending_dates=max(total_dates - summary["processed_dates"], 0),
+        failed_results=summary["failed_results"],
+        skipped_existing=skipped_existing,
+        last_request=summary_data["last_request"],
+    )
+    return summary
+
 
 def get_config_prompts():
     client = MongoClient(MONGO_URL)

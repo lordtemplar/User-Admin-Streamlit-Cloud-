@@ -3,7 +3,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple
 
+import requests
 import streamlit as st
+
+import config
 from .general_calendar import get_general_calendar
 from . import backend_utils
 
@@ -111,13 +114,45 @@ def ensure_calendar_entries(
     if basic_updates_payload:
         collection.update_one({"_id": user["_id"]}, {"$set": basic_updates_payload})
 
+
     gpt_triggered = False
+    gpt_details: Dict[str, Any] | None = None
+    success_statuses = {"queued", "running", "started", "completed", "success", "ok", "processed"}
+
     if can_predict:
-        try:
-            backend_utils.run_UpdatePeriodGPTAll_in_background(line_id)
+        remote_details = _trigger_remote_calendar_fix(line_id)
+        status_response = None
+        status_snapshot = None
+        status_value = remote_details.get("status") if isinstance(remote_details, dict) else None
+
+        if status_value in success_statuses:
             gpt_triggered = True
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"GPT background task: {exc}")
+
+        if status_value and status_value not in success_statuses:
+            message_text = remote_details.get("message") if isinstance(remote_details, dict) else None
+            errors.append(f"Remote GPT trigger failed: {message_text or status_value}")
+
+        if status_value not in success_statuses:
+            try:
+                status_response = backend_utils.run_UpdatePeriodGPTAll_in_background(line_id)
+                status_snapshot = backend_utils.get_gpt_task_status(line_id)
+                snapshot_status = status_snapshot.get("status") if isinstance(status_snapshot, dict) else None
+                response_status = status_response.get("status") if isinstance(status_response, dict) else None
+                status_value = snapshot_status or response_status or status_value
+                if status_value in success_statuses:
+                    gpt_triggered = True
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"GPT background task: {exc}")
+                status_response = {"status": "error", "message": str(exc), "line_id": line_id}
+
+        gpt_details = {
+            "status": status_value,
+            "remote_details": remote_details,
+            "status_response": status_response,
+            "status_snapshot": status_snapshot,
+        }
+    else:
+        gpt_details = {"status": "skipped", "message": "User missing birth_date; GPT calendar skipped.", "line_id": line_id}
 
     result: Dict[str, Any] = {
         "updated_days": updated_days,
@@ -125,6 +160,8 @@ def ensure_calendar_entries(
         "basic_profile_days": len(basic_profile_updates),
         "basic_holiday_days": len(basic_holiday_updates),
     }
+    if gpt_details is not None:
+        result["gpt_details"] = gpt_details
     if errors:
         result["errors"] = errors
     return result
@@ -140,4 +177,44 @@ def trigger_gpt_update(line_id: str) -> dict:
 
 def _fetch_star_prediction(birth_date: str, target_date: str) -> Dict[str, Any]:
     return backend_utils.Api5StarPredict(birth_date, target_date)
+
+
+def _trigger_remote_calendar_fix(line_id: str) -> Dict[str, Any]:
+    base_url = (config.API_BASE_URL or "").rstrip("/")
+    if not base_url:
+        return {"status": "skipped", "message": "API_BASE_URL is not configured.", "line_id": line_id}
+
+    url = f"{base_url}/calendar/fix"
+    params = {"line_id": line_id}
+    try:
+        response = requests.post(url, params=params, timeout=(5, 60))
+    except requests.Timeout as exc:
+        return {"status": "timeout", "message": f"{exc}", "line_id": line_id}
+    except requests.RequestException as exc:
+        return {"status": "error", "message": f"{exc}", "line_id": line_id}
+
+    try:
+        payload = response.json() if response.content else {}
+    except ValueError:
+        payload = {"raw": response.text}
+
+    if response.status_code >= 400:
+        return {
+            "status": "error",
+            "message": payload if isinstance(payload, str) else payload or response.text,
+            "http_status": response.status_code,
+            "line_id": line_id,
+        }
+
+    remote_status = payload.get("status") if isinstance(payload, dict) else None
+    if not remote_status:
+        remote_status = "started"
+
+    return {
+        "status": remote_status,
+        "message": payload.get("message") if isinstance(payload, dict) else None,
+        "http_status": response.status_code,
+        "payload": payload,
+        "line_id": line_id,
+    }
 
